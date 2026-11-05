@@ -110,6 +110,92 @@ BEGIN
     RETURN ROUND(v_minutos / 60, 2);
 END$$
 
+-- 4. Permite consultar quantas ordens de serviço existem para determinado cliente
+DROP FUNCTION IF EXISTS fn_total_os_cliente;
+
+DELIMITER $$
+
+CREATE FUNCTION fn_total_os_cliente(
+    p_cliente_id INT
+)
+RETURNS BIGINT
+NOT DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_total BIGINT DEFAULT 0;
+
+    SELECT COUNT(*)
+      INTO v_total
+      FROM ordens_servico
+     WHERE cliente_id = p_cliente_id;
+
+    RETURN v_total;
+END$$
+
+DELIMITER ;
+
+-- 5. Permite consultar quantas horas determinado funcionário registrou em apontamentos de trabalho
+DROP FUNCTION IF EXISTS fn_total_horas_funcionario;
+
+DELIMITER $$
+
+CREATE FUNCTION fn_total_horas_funcionario(
+    p_funcionario_id INT
+)
+RETURNS DECIMAL(10,2)
+NOT DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_total_minutos BIGINT DEFAULT 0;
+
+    SELECT COALESCE(SUM(duracao_minutos), 0)
+      INTO v_total_minutos
+      FROM apontamento_horas
+     WHERE funcionario_id = p_funcionario_id;
+
+    RETURN ROUND(v_total_minutos / 60, 2);
+END$$
+
+DELIMITER ;
+
+-- 6. Permite avaliar o cumprimento dos prazos de SLA de cada cliente
+
+DROP FUNCTION IF EXISTS fn_percentual_os_cliente_no_prazo;
+
+DELIMITER $$
+
+CREATE FUNCTION fn_percentual_os_cliente_no_prazo(
+    p_cliente_id INT
+)
+RETURNS DECIMAL(5,2)
+NOT DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_percentual DECIMAL(5,2) DEFAULT 0;
+
+    SELECT COALESCE(
+        ROUND(
+            100.0 * SUM(
+                CASE
+                    WHEN data_fim <= data_limite_sla THEN 1
+                    ELSE 0
+                END
+            ) / NULLIF(COUNT(*), 0),
+            2
+        ),
+        0
+    )
+    INTO v_percentual
+    FROM ordens_servico
+    WHERE cliente_id = p_cliente_id
+      AND status = 'concluido'
+      AND data_limite_sla IS NOT NULL;
+
+    RETURN v_percentual;
+END$$
+
+DELIMITER ;
+
 -- =====================================================================
 -- TRIGGERS
 -- =====================================================================
@@ -244,6 +330,108 @@ BEGIN
              '1', '0', @justificativa);
     END IF;
 END$$
+
+-- 4. Impedir o registro de horas com duração inválida,
+-- por funcionário inativo ou em uma OS inexistente, inativa ou já concluída
+DROP TRIGGER IF EXISTS trg_apontamento_bi_validar;
+
+DELIMITER $$
+
+CREATE TRIGGER trg_apontamento_bi_validar
+BEFORE INSERT ON apontamento_horas
+FOR EACH ROW
+BEGIN
+    DECLARE v_funcionario INT DEFAULT 0;
+    DECLARE v_os INT DEFAULT 0;
+
+    -- A duração precisa ser positiva.
+    IF NEW.duracao_minutos IS NULL
+       OR NEW.duracao_minutos <= 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'A duracao do apontamento deve ser maior que zero.';
+    END IF;
+
+    -- Verifica se o funcionário existe e está ativo.
+    SELECT COUNT(*)
+      INTO v_funcionario
+      FROM funcionarios
+     WHERE id = NEW.funcionario_id
+       AND ativo = TRUE;
+
+    IF v_funcionario = 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Funcionario inexistente ou inativo.';
+    END IF;
+
+    -- Verifica se a OS existe, está ativa e não foi concluída.
+    SELECT COUNT(*)
+      INTO v_os
+      FROM ordens_servico
+     WHERE id = NEW.os_id
+       AND ativo = TRUE
+       AND status <> 'concluido';
+
+    IF v_os = 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'OS inexistente, inativa ou ja concluida.';
+    END IF;
+END$$
+
+DELIMITER ;
+
+-- 5. Registrar automaticamente na tabela auditoria 
+-- quando um funcionário incluir horas em uma OS.
+DROP TRIGGER IF EXISTS trg_apontamento_ai_auditoria;
+
+DELIMITER $$
+
+CREATE TRIGGER trg_apontamento_ai_auditoria
+AFTER INSERT ON apontamento_horas
+FOR EACH ROW
+BEGIN
+    INSERT INTO auditoria
+        (os_id, funcionario_id, acao, campo_alterado,
+         dado_novo, justificativa)
+    VALUES
+        (
+            NEW.os_id,
+            NEW.funcionario_id,
+            'insercao',
+            'duracao_minutos',
+            CAST(NEW.duracao_minutos AS CHAR),
+            'Registro de apontamento de horas.'
+        );
+END$$
+
+DELIMITER ;
+
+-- 6. Manter o histórico quando a duração de um apontamento for modificada
+DROP TRIGGER IF EXISTS trg_apontamento_au_auditoria;
+
+DELIMITER $$
+
+CREATE TRIGGER trg_apontamento_au_auditoria
+AFTER UPDATE ON apontamento_horas
+FOR EACH ROW
+BEGIN
+    IF NOT (OLD.duracao_minutos <=> NEW.duracao_minutos) THEN
+        INSERT INTO auditoria
+            (os_id, funcionario_id, acao, campo_alterado,
+             dado_antigo, dado_novo, justificativa)
+        VALUES
+            (
+                NEW.os_id,
+                NEW.funcionario_id,
+                'atualizacao',
+                'duracao_minutos',
+                CAST(OLD.duracao_minutos AS CHAR),
+                CAST(NEW.duracao_minutos AS CHAR),
+                'Alteracao na duracao do apontamento.'
+            );
+    END IF;
+END$$
+
+DELIMITER ;
 
 -- =====================================================================
 -- STORED PROCEDURES
@@ -414,6 +602,170 @@ BEGIN
         FIELD(fn_situacao_sla(o.id), 'atrasada', 'em_risco', 'no_prazo', 'sem_sla'),
         FIELD(o.criticidade, 'urgente', 'muito_alto', 'alto', 'medio', 'baixo'),
         o.data_limite_sla;
+END$$
+
+DELIMITER ;
+
+-- 4. Permitir que um funcionário registre o tempo trabalhado em uma ordem de serviço
+DROP PROCEDURE IF EXISTS sp_registrar_apontamento;
+
+DELIMITER $$
+
+CREATE PROCEDURE sp_registrar_apontamento(
+    IN p_os_id INT,
+    IN p_funcionario_id INT,
+    IN p_duracao_minutos INT
+)
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    IF p_os_id IS NULL OR p_funcionario_id IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Informe a OS e o funcionario.';
+    END IF;
+
+    IF p_duracao_minutos IS NULL OR p_duracao_minutos <= 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'A duracao deve ser maior que zero.';
+    END IF;
+
+    START TRANSACTION;
+
+    INSERT INTO apontamento_horas
+        (os_id, funcionario_id, duracao_minutos)
+    VALUES
+        (p_os_id, p_funcionario_id, p_duracao_minutos);
+
+    COMMIT;
+END$$
+
+DELIMITER ;
+
+-- 5. Permitir que a gestão consulte quantas horas cada funcionário registrou, agrupando os resultados por departamento 
+DROP PROCEDURE IF EXISTS sp_relatorio_horas_departamento;
+
+DELIMITER $$
+
+CREATE PROCEDURE sp_relatorio_horas_departamento(
+    IN p_departamento_id INT
+)
+BEGIN
+    SELECT
+        d.id AS departamento_id,
+        d.nome AS departamento,
+        f.id AS funcionario_id,
+        f.nome AS funcionario,
+
+        COUNT(DISTINCT a.os_id) AS total_os_atendidas,
+
+        COALESCE(SUM(a.duracao_minutos), 0)
+            AS total_minutos,
+
+        ROUND(
+            COALESCE(SUM(a.duracao_minutos), 0) / 60,
+            2
+        ) AS total_horas
+
+    FROM departamentos d
+
+    INNER JOIN funcionarios f
+        ON f.departamento_id = d.id
+
+    LEFT JOIN apontamento_horas a
+        ON a.funcionario_id = f.id
+
+    WHERE
+        p_departamento_id IS NULL
+        OR d.id = p_departamento_id
+
+    GROUP BY
+        d.id,
+        d.nome,
+        f.id,
+        f.nome
+
+    ORDER BY
+        d.nome,
+        total_horas DESC;
+END$$
+
+DELIMITER ;
+
+-- 6. Permitir que a gestão recalcule os prazos de atendimento das ordens de serviço que ainda estão abertas
+DROP PROCEDURE IF EXISTS sp_recalcular_sla_pendentes;
+
+DELIMITER $$
+
+CREATE PROCEDURE sp_recalcular_sla_pendentes()
+BEGIN
+    DECLARE v_fim BOOLEAN DEFAULT FALSE;
+    DECLARE v_os_id INT;
+    DECLARE v_data_base DATETIME(6);
+    DECLARE v_prazo INT;
+    DECLARE v_processadas INT DEFAULT 0;
+
+    -- Cursor para buscar as ordens de serviço abertas
+    DECLARE cursor_os CURSOR FOR
+        SELECT
+            id,
+            COALESCE(data_inicio, data_criacao),
+            prazo_dias_uteis
+        FROM ordens_servico
+        WHERE ativo = TRUE
+          AND status <> 'concluido'
+          AND sla_manual = FALSE
+          AND prazo_dias_uteis IS NOT NULL
+        ORDER BY id;
+
+    -- Identifica quando o cursor não possui mais registros
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET v_fim = TRUE;
+
+    -- Em caso de erro, desfaz a transação
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    OPEN cursor_os;
+
+    loop_os: LOOP
+
+        FETCH cursor_os
+        INTO v_os_id, v_data_base, v_prazo;
+
+        IF v_fim THEN
+            LEAVE loop_os;
+        END IF;
+
+        -- Recalcula o prazo considerando apenas dias úteis
+        UPDATE ordens_servico
+        SET data_limite_sla = fn_somar_dias_uteis(
+            v_data_base,
+            v_prazo
+        )
+        WHERE id = v_os_id;
+
+        SET v_processadas = v_processadas + 1;
+
+    END LOOP;
+
+    CLOSE cursor_os;
+
+    COMMIT;
+
+    -- Retorna a quantidade de ordens processadas
+    SELECT
+        v_processadas AS total_os_processadas,
+        'Recalculo de SLA concluido.' AS mensagem;
+
 END$$
 
 DELIMITER ;
