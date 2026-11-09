@@ -214,7 +214,7 @@ CREATE TABLE apontamento_horas (
         UNIQUE (funcionario_id, os_id, data_trabalho),
 
     CONSTRAINT chk_apontamento_duracao
-        CHECK (duracao_minutos >= 0)
+        CHECK (duracao_minutos > 0)
 );
 
 CREATE INDEX idx_auditoria_os_data
