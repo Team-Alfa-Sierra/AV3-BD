@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Total de OS por cliente • AV3</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-100 text-slate-800">
+  <nav class="border-b border-slate-200 bg-white">
+    <div class="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-4">
+      <a href="/" class="font-bold text-blue-800">AV3 • Ordens de Serviço</a>
+      <div class="flex flex-wrap gap-2 text-sm">
+        <a href="/" class="rounded-lg px-4 py-2 font-semibold text-slate-600 hover:bg-slate-100">Abrir OS</a>
+        <a href="/total-os.html" class="rounded-lg bg-blue-50 px-4 py-2 font-semibold text-blue-800">Total de OS por cliente</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="mx-auto max-w-4xl px-4 py-10">
+    <header class="mb-8">
+      <p class="text-sm font-semibold uppercase tracking-wider text-blue-700">Consulta • FUNCTION MySQL</p>
+      <h1 class="mt-2 text-3xl font-bold">Total de ordens de serviço por cliente</h1>
+      <p class="mt-2 text-slate-600">Selecione um cliente para consultar quantas ordens de serviço estão cadastradas para ele.</p>
+    </header>
+
+    <section class="rounded-xl bg-white p-6 shadow-sm">
+      <form id="form-consulta" class="flex flex-col gap-4 sm:flex-row sm:items-end">
+        <label class="block flex-1">
+          <span class="mb-1 block text-sm font-medium">Cliente</span>
+          <select id="cliente_id" required class="w-full rounded-lg border border-slate-300 px-3 py-2.5">
+            <option value="">Carregando clientes...</option>
+          </select>
+        </label>
+        <button id="btn-consultar" type="submit" class="rounded-lg bg-blue-700 px-5 py-2.5 font-semibold text-white hover:bg-blue-800 disabled:opacity-50">Consultar total</button>
+      </form>
+      <p id="mensagem" role="status" class="mt-4 hidden rounded-lg p-3 text-sm"></p>
+
+      <div id="resultado" class="mt-6 hidden rounded-xl border border-blue-100 bg-blue-50 p-6">
+        <p class="text-sm font-medium text-blue-800">Total de ordens de serviço</p>
+        <p id="total" class="mt-1 text-4xl font-bold text-blue-950">0</p>
+        <p id="cliente-nome" class="mt-2 text-sm text-blue-800"></p>
+      </div>
+    </section>
+
+  </main>
+
+<script>
+const selectCliente = document.getElementById("cliente_id");
+const form = document.getElementById("form-consulta");
+const botao = document.getElementById("btn-consultar");
+const mensagem = document.getElementById("mensagem");
+const resultado = document.getElementById("resultado");
+
+function mostrarMensagem(texto, sucesso = false) {
+  mensagem.textContent = texto;
+  mensagem.className = sucesso
+    ? "mt-4 rounded-lg bg-green-50 p-3 text-sm text-green-800"
+    : "mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-800";
+}
+
+async function carregarClientes() {
+  try {
+    const resposta = await fetch("/api/opcoes");
+    const dados = await resposta.json();
+    if (!resposta.ok) throw new Error(dados.mensagem || "Não foi possível carregar os clientes.");
+
+    selectCliente.innerHTML = '<option value="">Selecione um cliente</option>';
+    dados.clientes.forEach(cliente => {
+      const opcao = document.createElement("option");
+      opcao.value = cliente.id;
+      opcao.textContent = cliente.nome;
+      selectCliente.appendChild(opcao);
+    });
+  } catch (erro) {
+    selectCliente.innerHTML = '<option value="">Erro ao carregar clientes</option>';
+    mostrarMensagem(erro.message);
+  }
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const clienteId = selectCliente.value;
+  if (!clienteId) return;
+
+  botao.disabled = true;
+  botao.textContent = "Consultando...";
+  mensagem.className = "hidden";
+  resultado.classList.add("hidden");
+
+  try {
+    const resposta = await fetch(`/api/clientes/${encodeURIComponent(clienteId)}/total-os`);
+    const dados = await resposta.json();
+    if (!resposta.ok) throw new Error(dados.mensagem || "Não foi possível consultar a FUNCTION.");
+
+    document.getElementById("total").textContent = Number(dados.total).toLocaleString("pt-BR");
+    document.getElementById("cliente-nome").textContent = `Cliente: ${selectCliente.selectedOptions[0].textContent}`;
+    resultado.classList.remove("hidden");
+    mostrarMensagem("Consulta realizada com sucesso pela FUNCTION do MySQL.", true);
+  } catch (erro) {
+    mostrarMensagem(erro.message);
+  } finally {
+    botao.disabled = false;
+    botao.textContent = "Consultar total";
+  }
+});
+
+carregarClientes();
+</script>
+</body>
+</html>

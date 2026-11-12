@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Abertura de Ordem de Serviço</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-100 text-slate-800">
+  <nav class="border-b border-slate-200 bg-white">
+    <div class="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-4">
+      <a href="/" class="font-bold text-blue-800">AV3 • Ordens de Serviço</a>
+      <div class="flex flex-wrap gap-2 text-sm">
+        <a href="/" class="rounded-lg bg-blue-50 px-4 py-2 font-semibold text-blue-800">Abrir OS</a>
+        <a href="/total-os.html" class="rounded-lg px-4 py-2 font-semibold text-slate-600 hover:bg-slate-100">Total de OS por cliente</a>
+      </div>
+    </div>
+  </nav>
+  <main class="mx-auto max-w-4xl px-4 py-10">
+    <header class="mb-8">
+      <p class="text-sm font-semibold uppercase tracking-wider text-blue-700">AV3 • Gestão de serviços</p>
+      <h1 class="mt-2 text-3xl font-bold">Abertura de ordem de serviço</h1>
+      <p class="mt-2 text-slate-600">Preencha os dados abaixo para registrar uma nova solicitação.</p>
+    </header>
+
+    <section class="rounded-xl bg-white p-6 shadow-sm">
+      <form id="form-os" class="space-y-5">
+        <div class="grid gap-5 md:grid-cols-2">
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">Cliente *</span>
+            <select name="cliente_id" id="cliente_id" required class="w-full rounded-lg border border-slate-300 px-3 py-2.5">
+              <option value="">Carregando...</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">Departamento *</span>
+            <select name="departamento_id" id="departamento_id" required class="w-full rounded-lg border border-slate-300 px-3 py-2.5"></select>
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">Solicitante *</span>
+            <select name="solicitante_id" id="solicitante_id" required class="w-full rounded-lg border border-slate-300 px-3 py-2.5"></select>
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">Projeto</span>
+            <select name="projeto_id" id="projeto_id" class="w-full rounded-lg border border-slate-300 px-3 py-2.5"></select>
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">Local operacional</span>
+            <select name="local_id" id="local_id" class="w-full rounded-lg border border-slate-300 px-3 py-2.5"></select>
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">Tipo *</span>
+            <select name="tipo" required class="w-full rounded-lg border border-slate-300 px-3 py-2.5">
+              <option value="">Selecione</option>
+              <option value="instalacao">Instalação</option>
+              <option value="manutencao">Manutenção</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">Criticidade *</span>
+            <select name="criticidade" required class="w-full rounded-lg border border-slate-300 px-3 py-2.5">
+              <option value="">Selecione</option>
+              <option value="baixo">Baixo</option>
+              <option value="medio">Médio</option>
+              <option value="alto">Alto</option>
+              <option value="muito_alto">Muito alto</option>
+              <option value="urgente">Urgente</option>
+            </select>
+          </label>
+        </div>
+
+        <label class="block">
+          <span class="mb-1 block text-sm font-medium">Título *</span>
+          <input name="titulo" maxlength="191" required class="w-full rounded-lg border border-slate-300 px-3 py-2.5" placeholder="Resuma o problema ou serviço solicitado">
+        </label>
+        <label class="block">
+          <span class="mb-1 block text-sm font-medium">Descrição *</span>
+          <textarea name="descricao" maxlength="2000" required rows="4" class="w-full rounded-lg border border-slate-300 px-3 py-2.5" placeholder="Descreva a solicitação (máximo de 2.000 caracteres)"></textarea>
+        </label>
+
+        <div class="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-5">
+          <button id="btn-enviar" type="submit" class="rounded-lg bg-blue-700 px-5 py-2.5 font-semibold text-white hover:bg-blue-800 disabled:opacity-50">Abrir ordem de serviço</button>
+          <button type="reset" class="rounded-lg border border-slate-300 px-5 py-2.5 font-semibold hover:bg-slate-50">Limpar</button>
+        </div>
+        <p id="mensagem" role="status" class="hidden rounded-lg p-3 text-sm"></p>
+      </form>
+    </section>
+    <p class="mt-5 text-xs text-slate-500">* Campos obrigatórios. O registro será criado com status inicial “Aguardando”.</p>
+  </main>
+
+<script>
+const form = document.querySelector("#form-os");
+const mensagem = document.querySelector("#mensagem");
+const btn = document.querySelector("#btn-enviar");
+let dados = null;
+
+function preencher(selectId, itens, texto, valor = "nome") {
+  const select = document.getElementById(selectId);
+  select.innerHTML = `<option value="">${texto}</option>`;
+  itens.forEach(item => {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = item[valor];
+    select.appendChild(option);
+  });
+}
+
+function filtrarRelacionados() {
+  if (!dados) return;
+  const departamentoId = Number(document.getElementById("departamento_id").value);
+  preencher("solicitante_id", dados.funcionarios.filter(f => f.departamento_id === departamentoId), "Selecione o solicitante");
+  const clienteId = Number(document.getElementById("cliente_id").value);
+  preencher("projeto_id", dados.projetos.filter(p => p.cliente_id === clienteId), "Sem projeto");
+  preencher("local_id", dados.locais.filter(l => l.cliente_id === clienteId), "Sem local", "descricao");
+}
+
+async function carregarOpcoes() {
+  const resposta = await fetch("/api/opcoes");
+  if (!resposta.ok) throw new Error("Falha ao carregar opções do formulário.");
+  dados = await resposta.json();
+  preencher("cliente_id", dados.clientes, "Selecione o cliente");
+  preencher("departamento_id", dados.departamentos, "Selecione o departamento");
+  preencher("solicitante_id", dados.funcionarios, "Selecione o solicitante");
+  preencher("projeto_id", [], "Selecione primeiro o cliente");
+  preencher("local_id", [], "Selecione primeiro o cliente", "descricao");
+}
+
+document.getElementById("cliente_id").addEventListener("change", filtrarRelacionados);
+document.getElementById("departamento_id").addEventListener("change", filtrarRelacionados);
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  mensagem.className = "hidden";
+  btn.disabled = true;
+  btn.textContent = "Enviando...";
+  try {
+    const dadosFormulario = Object.fromEntries(new FormData(form).entries());
+    const resposta = await fetch("/api/ordens-servico", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dadosFormulario)
+    });
+    const resultado = await resposta.json();
+    if (!resposta.ok) throw new Error(resultado.mensagem || "Erro ao abrir a OS.");
+    mensagem.textContent = resultado.mensagem;
+    mensagem.className = "rounded-lg bg-green-50 p-3 text-sm text-green-800";
+    form.reset();
+    filtrarRelacionados();
+  } catch (erro) {
+    mensagem.textContent = erro.message;
+    mensagem.className = "rounded-lg bg-red-50 p-3 text-sm text-red-800";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Abrir ordem de serviço";
+  }
+});
+
+carregarOpcoes().catch(erro => {
+  mensagem.textContent = erro.message + " Verifique a conexão com o banco e se existem cadastros.";
+  mensagem.className = "rounded-lg bg-red-50 p-3 text-sm text-red-800";
+});
+</script>
+</body>
+</html>
