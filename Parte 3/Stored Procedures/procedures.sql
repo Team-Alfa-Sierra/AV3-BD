@@ -1,5 +1,7 @@
 USE AV3_db;
 
+-- A VIEW resume os apontamentos por funcionario.
+-- Ela e utilizada pela procedure sp_relatorio_horas_departamento.
 DROP VIEW IF EXISTS vw_resumo_horas_funcionario;
 
 CREATE VIEW vw_resumo_horas_funcionario AS
@@ -16,7 +18,7 @@ LEFT JOIN apontamento_horas a
     ON a.funcionario_id = f.id
 GROUP BY f.id, f.departamento_id, f.nome;
 
--- Remove as procedures anteriores
+-- Remove as procedures anteriores para permitir a recriacao.
 DROP PROCEDURE IF EXISTS sp_recalcular_sla_pendentes;
 DROP PROCEDURE IF EXISTS sp_relatorio_horas_departamento;
 DROP PROCEDURE IF EXISTS sp_registrar_apontamento;
@@ -26,7 +28,7 @@ DROP PROCEDURE IF EXISTS sp_abrir_os;
 
 DELIMITER $$
 
--- 1. Abre uma OS validando cliente, solicitante, departamento e projeto
+-- 1. Abre uma OS e valida os relacionamentos informados.
 CREATE PROCEDURE sp_abrir_os(
     IN p_departamento_id INT,
     IN p_cliente_id INT,
@@ -50,13 +52,27 @@ BEGIN
 
     SET p_os_id = NULL;
 
-    IF p_departamento_id IS NULL OR p_cliente_id IS NULL
+    -- Campos obrigatorios.
+    IF p_departamento_id IS NULL
+       OR p_cliente_id IS NULL
        OR p_solicitante_id IS NULL
-       OR p_tipo IS NULL OR p_criticidade IS NULL
+       OR p_tipo IS NULL
+       OR p_criticidade IS NULL
        OR p_titulo IS NULL OR TRIM(p_titulo) = ''
        OR p_descricao IS NULL OR TRIM(p_descricao) = '' THEN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'Preencha os campos obrigatorios para abrir a OS.';
+    END IF;
+
+    -- Valores permitidos pelos ENUMs da tabela ordens_servico.
+    IF p_tipo NOT IN ('instalacao', 'manutencao') THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Tipo de OS invalido.';
+    END IF;
+
+    IF p_criticidade NOT IN ('baixo', 'medio', 'alto', 'muito_alto', 'urgente') THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Criticidade invalida.';
     END IF;
 
     SELECT COUNT(*) INTO v_total
@@ -78,16 +94,33 @@ BEGIN
             SET MESSAGE_TEXT = 'Cliente inexistente ou inativo.';
     END IF;
 
+    -- O solicitante precisa estar ativo e pertencer ao departamento da OS.
     SELECT COUNT(*) INTO v_total
       FROM funcionarios
      WHERE id = p_solicitante_id
-       AND ativo = TRUE;
+       AND ativo = TRUE
+       AND departamento_id = p_departamento_id;
 
     IF v_total = 0 THEN
         SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Solicitante inexistente ou inativo.';
+            SET MESSAGE_TEXT = 'Solicitante inexistente, inativo ou de outro departamento.';
     END IF;
 
+    -- O local e opcional, mas, quando informado, deve pertencer ao cliente.
+    IF p_local_id IS NOT NULL THEN
+        SELECT COUNT(*) INTO v_total
+          FROM locais_operacionais
+         WHERE id = p_local_id
+           AND cliente_id = p_cliente_id;
+
+        IF v_total = 0 THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Local operacional invalido para este cliente.';
+        END IF;
+    END IF;
+
+    -- O projeto precisa pertencer ao cliente, estar ativo,
+    -- estar em planejamento/em andamento e atender ao departamento.
     IF p_projeto_id IS NOT NULL THEN
         SELECT COUNT(*) INTO v_total
           FROM projetos p
@@ -107,28 +140,35 @@ BEGIN
 
     START TRANSACTION;
 
-    INSERT INTO ordens_servico
-        (departamento_id, cliente_id, solicitante_id, projeto_id,
-         local_operacional_id, tipo, criticidade, titulo, descricao, status)
-    VALUES
-        (p_departamento_id, p_cliente_id, p_solicitante_id, p_projeto_id,
-         p_local_id, p_tipo, p_criticidade, p_titulo, p_descricao, 'aguardando');
+    INSERT INTO ordens_servico (
+        departamento_id, cliente_id, solicitante_id, projeto_id,
+        local_operacional_id, tipo, criticidade, titulo, descricao, status
+    )
+    VALUES (
+        p_departamento_id, p_cliente_id, p_solicitante_id, p_projeto_id,
+        p_local_id, p_tipo, p_criticidade, TRIM(p_titulo),
+        TRIM(p_descricao), 'aguardando'
+    );
 
     SET p_os_id = LAST_INSERT_ID();
 
-    INSERT INTO auditoria
-        (os_id, funcionario_id, acao, dado_novo, justificativa)
-    VALUES
-        (p_os_id, p_solicitante_id, 'insercao', p_titulo,
-         'Abertura da ordem de servico.');
+    -- O registro de auditoria faz parte da mesma transacao da OS.
+    INSERT INTO auditoria (
+        os_id, funcionario_id, acao, dado_novo, justificativa
+    )
+    VALUES (
+        p_os_id, p_solicitante_id, 'insercao', TRIM(p_titulo),
+        'Abertura da ordem de servico.'
+    );
 
     COMMIT;
 
-    SELECT p_os_id AS os_id,
-           'Ordem de servico aberta com sucesso.' AS mensagem;
+    SELECT
+        p_os_id AS os_id,
+        'Ordem de servico aberta com sucesso.' AS mensagem;
 END$$
 
--- 2. Painel das OS abertas, priorizando SLA e criticidade
+-- 2. Exibe OS abertas, priorizando situacao do SLA e criticidade.
 CREATE PROCEDURE sp_painel_sla(
     IN p_departamento_id INT
 )
@@ -160,8 +200,9 @@ BEGIN
         o.data_limite_sla;
 END$$
 
--- 3. Registra apontamento com data obrigatoria e descricao opcional
---    A validacao de funcionario/OS e a auditoria sao feitas pelos triggers
+-- 3. Registra horas trabalhadas em uma OS.
+-- O trigger trg_apontamento_bi_validar valida funcionario/OS e
+-- trg_apontamento_ai_auditoria registra a inclusao na auditoria.
 CREATE PROCEDURE sp_registrar_apontamento(
     IN p_os_id INT,
     IN p_funcionario_id INT,
@@ -180,21 +221,22 @@ BEGIN
             SET MESSAGE_TEXT = 'A duracao deve ser maior que zero.';
     END IF;
 
-    INSERT INTO apontamento_horas
-        (os_id, funcionario_id, data_trabalho, duracao_minutos, descricao)
-    VALUES
-        (p_os_id, p_funcionario_id, p_data_trabalho,
-         p_duracao_minutos, p_descricao);
+    INSERT INTO apontamento_horas (
+        os_id, funcionario_id, data_trabalho, duracao_minutos, descricao
+    )
+    VALUES (
+        p_os_id, p_funcionario_id, p_data_trabalho,
+        p_duracao_minutos, p_descricao
+    );
 
-    SELECT LAST_INSERT_ID() AS apontamento_id,
-           'Apontamento registrado com sucesso.' AS mensagem;
+    SELECT
+        LAST_INSERT_ID() AS apontamento_id,
+        'Apontamento registrado com sucesso.' AS mensagem;
 END$$
 
--- 4. Relatorio por departamento. RIGHT JOIN mantem departamentos
---    mesmo quando ainda nao possuem funcionarios
---    A VIEW agrega os apontamentos por funcionario
---    A subconsulta EXISTS identifica funcionarios com pelo menos um
---    apontamento vinculado a uma OS ainda cadastrada
+-- 4. Relatorio de horas por departamento e funcionario.
+-- RIGHT JOIN preserva departamentos sem funcionarios;
+-- a VIEW agrega os apontamentos; EXISTS classifica a situacao.
 CREATE PROCEDURE sp_relatorio_horas_departamento(
     IN p_departamento_id INT
 )
@@ -228,7 +270,7 @@ BEGIN
     ORDER BY d.nome, f.nome;
 END$$
 
--- 5. Recalcula o SLA das OS abertas usando cursor
+-- 5. Recalcula o SLA das OS pendentes usando CURSOR.
 CREATE PROCEDURE sp_recalcular_sla_pendentes()
 BEGIN
     DECLARE v_fim BOOLEAN DEFAULT FALSE;
@@ -238,15 +280,16 @@ BEGIN
     DECLARE v_processadas INT DEFAULT 0;
 
     DECLARE cursor_os CURSOR FOR
-        SELECT id,
-               COALESCE(data_inicio, data_criacao),
-               prazo_dias_uteis
-          FROM ordens_servico
-         WHERE ativo = TRUE
-           AND status <> 'concluido'
-           AND sla_manual = FALSE
-           AND prazo_dias_uteis IS NOT NULL
-         ORDER BY id;
+        SELECT
+            id,
+            COALESCE(data_inicio, data_criacao),
+            prazo_dias_uteis
+        FROM ordens_servico
+        WHERE ativo = TRUE
+          AND status <> 'concluido'
+          AND sla_manual = FALSE
+          AND prazo_dias_uteis IS NOT NULL
+        ORDER BY id;
 
     DECLARE CONTINUE HANDLER FOR NOT FOUND
         SET v_fim = TRUE;
@@ -276,16 +319,16 @@ BEGIN
     END LOOP;
 
     CLOSE cursor_os;
+
     COMMIT;
 
-    SELECT v_processadas AS total_os_processadas,
-           'Recalculo de SLA concluido.' AS mensagem;
+    SELECT
+        v_processadas AS total_os_processadas,
+        'Recalculo de SLA concluido.' AS mensagem;
 END$$
 
-DELIMITER ;
-
--- 6. Conclui uma OS. O funcionario ativo deve pertencer ao departamento
---    da OS e passa a ser registrado como responsavel pela conclusao
+-- 6. Conclui uma OS. O funcionario deve estar ativo e pertencer
+-- ao departamento da OS. O trigger preenche data_fim e audita a mudanca.
 CREATE PROCEDURE sp_concluir_os(
     IN p_os_id INT,
     IN p_funcionario_id INT,
@@ -312,6 +355,11 @@ BEGIN
             SET MESSAGE_TEXT = 'Informe o parecer tecnico para concluir a OS.';
     END IF;
 
+    IF CHAR_LENGTH(TRIM(p_parecer_tecnico)) > 191 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'O parecer tecnico deve ter no maximo 191 caracteres.';
+    END IF;
+
     START TRANSACTION;
 
     SELECT COUNT(*) INTO v_total
@@ -335,7 +383,7 @@ BEGIN
     UPDATE ordens_servico
        SET status = 'concluido',
            responsavel_id = p_funcionario_id,
-           parecer_tecnico = p_parecer_tecnico
+           parecer_tecnico = TRIM(p_parecer_tecnico)
      WHERE id = p_os_id;
 
     SET @funcionario_atual = NULL;
@@ -343,41 +391,141 @@ BEGIN
 
     COMMIT;
 
-    SELECT 'Ordem de servico concluida com sucesso.' AS mensagem;
+    SELECT
+        'Ordem de servico concluida com sucesso.' AS mensagem;
 END$$
 
--- -------------------------
--- TESTES DAS 6 PROCEDURES E DA VIEW
--- -------------------------
+DELIMITER ;
 
--- Teste da VIEW:
-SELECT * FROM vw_resumo_horas_funcionario ORDER BY departamento_id, funcionario_id LIMIT 20;
+-- =========================================================
+-- TESTES REAIS DAS 6 PROCEDURES E DA VIEW
+-- Pre-requisitos: executar script_av3.sql, seed_insert.sql,
+-- functions.sql e triggers.sql antes deste arquivo.
+-- Execute os testes na MESMA conexao do Workbench, pois eles
+-- compartilham variaveis de sessao (@...).
+-- Os testes 1, 3 e 6 criam/alteram registros de demonstracao.
+-- =========================================================
 
--- Teste 1: abrir OS. Use IDs validos existentes e um projeto/departamento
--- compativel (ou NULL para projeto/local, se permitido).
--- CALL sp_abrir_os(1, 1, 1, NULL, NULL, 'manutencao', 'alto',
---                  'OS de teste', 'Descricao da OS de teste', @nova_os);
--- SELECT @nova_os;
--- SELECT * FROM ordens_servico WHERE id = @nova_os;
+-- Preparacao: seleciona cliente ativo e funcionario ativo,
+-- usando o departamento real ao qual o funcionario pertence.
+SELECT
+    f.id,
+    f.departamento_id,
+    c.id
+INTO
+    @funcionario_teste,
+    @departamento_teste,
+    @cliente_teste
+FROM funcionarios f
+CROSS JOIN clientes c
+WHERE f.ativo = TRUE
+  AND c.ativo = TRUE
+ORDER BY f.id, c.id
+LIMIT 1;
 
--- Teste 2: painel geral e por departamento.
+-- Teste da VIEW utilizada pela procedure 4.
+SELECT *
+FROM vw_resumo_horas_funcionario
+ORDER BY departamento_id, funcionario_id
+LIMIT 20;
+
+-- TESTE 1: abertura de OS.
+CALL sp_abrir_os(
+    @departamento_teste,
+    @cliente_teste,
+    @funcionario_teste,
+    NULL,
+    NULL,
+    'manutencao',
+    'alto',
+    'TESTE PROCEDURE - Abertura de OS',
+    'Registro criado pelo teste automatizado da procedure sp_abrir_os.',
+    @nova_os
+);
+
+-- Conferencia da OS e do registro de auditoria.
+SELECT
+    id, departamento_id, cliente_id, solicitante_id,
+    tipo, criticidade, status, titulo, prazo_dias_uteis,
+    data_limite_sla
+FROM ordens_servico
+WHERE id = @nova_os;
+
+SELECT
+    id, os_id, funcionario_id, acao, dado_novo, justificativa
+FROM auditoria
+WHERE os_id = @nova_os
+ORDER BY id;
+
+-- TESTE 2: painel geral de SLA e painel filtrado por departamento.
 CALL sp_painel_sla(NULL);
--- CALL sp_painel_sla(1);
+CALL sp_painel_sla(@departamento_teste);
 
--- Teste 3: registrar apontamento (data agora e parametro obrigatorio).
--- CALL sp_registrar_apontamento(<OS_ABERTA>, <FUNCIONARIO_ATIVO>,
---                               CURRENT_DATE(), 90, 'Atividade de teste');
--- SELECT * FROM apontamento_horas ORDER BY id DESC LIMIT 5;
+-- TESTE 3: apontamento de horas na OS criada no teste 1.
+CALL sp_registrar_apontamento(
+    @nova_os,
+    @funcionario_teste,
+    CURRENT_DATE(),
+    90,
+    'Teste real de apontamento de horas pela procedure.'
+);
 
--- Teste 4: relatorio com RIGHT JOIN, VIEW, GROUP BY (na VIEW) e EXISTS.
+-- Guarda o identificador do apontamento mais recente da OS de teste.
+SELECT MAX(id)
+INTO @apontamento_teste
+FROM apontamento_horas
+WHERE os_id = @nova_os
+  AND funcionario_id = @funcionario_teste;
+
+-- Confere apontamento e auditoria criada pelo trigger AFTER INSERT.
+SELECT *
+FROM apontamento_horas
+WHERE id = @apontamento_teste;
+
+SELECT *
+FROM auditoria
+WHERE os_id = @nova_os
+ORDER BY id;
+
+-- TESTE 4: relatorio de todos os departamentos e de um departamento.
 CALL sp_relatorio_horas_departamento(NULL);
--- CALL sp_relatorio_horas_departamento(1);
+CALL sp_relatorio_horas_departamento(@departamento_teste);
 
--- Teste 5: cursor de recalculo de SLA.
+-- TESTE 5: recalculo de SLA das OS abertas.
+-- Coloca temporariamente uma data limite incorreta na OS de teste.
+-- O trigger de UPDATE nao recalcula porque prazo/data_inicio nao mudaram.
+UPDATE ordens_servico
+SET data_limite_sla = DATE_SUB(
+    COALESCE(data_inicio, data_criacao), INTERVAL 1 DAY
+)
+WHERE id = @nova_os;
+
+SELECT id, prazo_dias_uteis, data_limite_sla AS sla_antes
+FROM ordens_servico
+WHERE id = @nova_os;
+
 CALL sp_recalcular_sla_pendentes();
 
--- Teste 6: concluir OS com funcionario ativo do mesmo departamento.
--- CALL sp_concluir_os(<OS_ABERTA>, <FUNCIONARIO_DO_DEPARTAMENTO>,
---                     'Servico concluido e validado.');
--- SELECT id, status, responsavel_id, data_fim, parecer_tecnico
---   FROM ordens_servico WHERE id = <OS_ABERTA>;
+SELECT id, prazo_dias_uteis, data_limite_sla AS sla_recalculado
+FROM ordens_servico
+WHERE id = @nova_os;
+
+-- TESTE 6: conclui a OS criada no teste 1.
+CALL sp_concluir_os(
+    @nova_os,
+    @funcionario_teste,
+    'Servico de teste concluido e validado.'
+);
+
+-- Confere status, datas, responsavel e parecer tecnico.
+SELECT
+    id, status, responsavel_id, data_inicio, data_fim,
+    parecer_tecnico
+FROM ordens_servico
+WHERE id = @nova_os;
+
+-- Confere os registros de auditoria gerados na conclusao.
+SELECT *
+FROM auditoria
+WHERE os_id = @nova_os
+ORDER BY id;
